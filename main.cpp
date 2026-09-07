@@ -1,194 +1,1683 @@
+#define WIN32_LEAN_AND_MEAN
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
 #include <iostream>
-#include <vector>
 #include <string>
-#include "01_Movie.cpp"
-#include "02_Seat.cpp"
-#include "03_Screen.cpp"
-#include "04_Cinema.cpp"
-#include "06_ShowSeat.cpp"
-#include "05_Show.cpp"
-#include "07_Customer.cpp"
-#include "09_Payment.cpp"
-#include "10_PaymentTypes.cpp"
-#include "08_Booking.cpp"
-#include "11_PriceCalculator.cpp"
-#include "12_TicketPrinter.cpp"
-#include "13_BookingService.cpp"
-using namespace std;
+#include <vector>
+#include <unordered_map>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <sstream>
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <cstring>
 
-vector<Seat> buildStandardSeats() {
-    vector<Seat> seats;
-    seats.push_back(Seat("A1", SeatType::SILVER));
-    seats.push_back(Seat("A2", SeatType::SILVER));
-    seats.push_back(Seat("A3", SeatType::SILVER));
-    seats.push_back(Seat("A4", SeatType::SILVER));
-    seats.push_back(Seat("B1", SeatType::GOLD));
-    seats.push_back(Seat("B2", SeatType::GOLD));
-    seats.push_back(Seat("B3", SeatType::GOLD));
-    seats.push_back(Seat("C1", SeatType::PLATINUM));
-    seats.push_back(Seat("C2", SeatType::PLATINUM));
-    return seats;
-}
+#pragma comment(lib, "ws2_32.lib")
 
-void printSeatLayout(Show* show) {
-    cout << endl;
-    cout << "SCREEN-" << show->getScreen()->getScreenNumber() << "   " << show->getStartTime()
-         << "  |  " << show->getMovie()->getTitle() << endl;
+// ============================================================
+// CONFIGURATION
+// ============================================================
 
-    vector<ShowSeat>& seats = show->getShowSeats();
-    string types[3] = {"SILVER", "GOLD", "PLATINUM"};
-    SeatType typeEnums[3] = {SeatType::SILVER, SeatType::GOLD, SeatType::PLATINUM};
+constexpr int PORT = 8080;
 
-    for (int t = 0; t < 3; t++) {
-        cout << types[t] << "  ";
-        for (int i = 0; i < (int)seats.size(); i++) {
-            if (seats[i].getSeat().getType() == typeEnums[t]) {
-                cout << seats[i].getSeat().getSeatNumber()
-                     << (seats[i].isAvailable() ? "[ ]" : "[X]") << " ";
+constexpr int WORKER_THREADS = 128;
+
+constexpr int IOCP_THREADS = 4;
+
+constexpr int LISTEN_BACKLOG = SOMAXCONN;
+
+constexpr int BUFFER_SIZE = 8192;
+
+
+// ============================================================
+// THREAD POOL
+// ============================================================
+
+class ThreadPool {
+
+private:
+
+    std::vector<std::thread> workers;
+
+    std::queue<std::function<void()>> tasks;
+
+    std::mutex queueMutex;
+
+    std::condition_variable condition;
+
+    bool stopping = false;
+
+
+public:
+
+    ThreadPool(int threadCount) {
+
+        for (int i = 0; i < threadCount; ++i) {
+
+            workers.emplace_back([this]() {
+
+                while (true) {
+
+                    std::function<void()> task;
+
+                    {
+                        std::unique_lock<std::mutex> lock(
+                            queueMutex
+                        );
+
+                        condition.wait(
+                            lock,
+                            [this]() {
+                                return stopping ||
+                                       !tasks.empty();
+                            }
+                        );
+
+                        if (
+                            stopping &&
+                            tasks.empty()
+                        ) {
+                            return;
+                        }
+
+                        task =
+                            std::move(tasks.front());
+
+                        tasks.pop();
+                    }
+
+                    task();
+                }
+            });
+        }
+    }
+
+
+    void enqueue(
+        std::function<void()> task
+    ) {
+
+        {
+            std::lock_guard<std::mutex> lock(
+                queueMutex
+            );
+
+            if (stopping) {
+                return;
+            }
+
+            tasks.push(
+                std::move(task)
+            );
+        }
+
+        condition.notify_one();
+    }
+
+
+    ~ThreadPool() {
+
+        {
+            std::lock_guard<std::mutex> lock(
+                queueMutex
+            );
+
+            stopping = true;
+        }
+
+        condition.notify_all();
+
+        for (auto& worker : workers) {
+
+            if (worker.joinable()) {
+                worker.join();
             }
         }
-        cout << endl;
     }
-    cout << endl;
-    cout << "( [ ] = available   [X] = booked )" << endl;
+};
+
+
+// ============================================================
+// MOVIE
+// ============================================================
+
+class Movie {
+
+public:
+
+    int id;
+
+    std::string title;
+
+    std::string language;
+
+    int duration;
+
+
+    Movie(
+        int id,
+        std::string title,
+        std::string language,
+        int duration
+    )
+        : id(id),
+          title(std::move(title)),
+          language(std::move(language)),
+          duration(duration) {}
+};
+
+
+// ============================================================
+// SEAT
+// ============================================================
+
+class Seat {
+
+public:
+
+    std::string number;
+
+    std::string type;
+
+    int price;
+
+    bool booked;
+
+
+    Seat() = default;
+
+
+    Seat(
+        std::string number,
+        std::string type,
+        int price
+    )
+        : number(std::move(number)),
+          type(std::move(type)),
+          price(price),
+          booked(false) {}
+};
+
+
+// ============================================================
+// SHOW
+// ============================================================
+
+class Show {
+
+public:
+
+    int id;
+
+    int movieId;
+
+    int screenId;
+
+    std::string time;
+
+
+    Show(
+        int id,
+        int movieId,
+        int screenId,
+        std::string time
+    )
+        : id(id),
+          movieId(movieId),
+          screenId(screenId),
+          time(std::move(time)) {}
+};
+
+
+// ============================================================
+// BOOKING
+// ============================================================
+
+class Booking {
+
+public:
+
+    int id;
+
+    std::string seat;
+
+    int amount;
+
+
+    Booking(
+        int id,
+        std::string seat,
+        int amount
+    )
+        : id(id),
+          seat(std::move(seat)),
+          amount(amount) {}
+};
+
+
+// ============================================================
+// BOOKING SERVICE
+// ============================================================
+
+class BookingService {
+
+private:
+
+    std::unordered_map<
+        std::string,
+        Seat
+    > seats;
+
+    std::vector<Booking> bookings;
+
+    std::mutex bookingMutex;
+
+    std::atomic<int> nextBookingId{1};
+
+
+public:
+
+    BookingService() {
+
+        // ----------------------------------------------------
+        // SILVER
+        // ----------------------------------------------------
+
+        for (int i = 1; i <= 34; ++i) {
+
+            std::string seat =
+                "A" + std::to_string(i);
+
+            seats.emplace(
+                seat,
+                Seat(
+                    seat,
+                    "Silver",
+                    150
+                )
+            );
+        }
+
+
+        // ----------------------------------------------------
+        // GOLD
+        // ----------------------------------------------------
+
+        for (int i = 35; i <= 67; ++i) {
+
+            std::string seat =
+                "A" + std::to_string(i);
+
+            seats.emplace(
+                seat,
+                Seat(
+                    seat,
+                    "Gold",
+                    250
+                )
+            );
+        }
+
+
+        // ----------------------------------------------------
+        // PLATINUM
+        // ----------------------------------------------------
+
+        for (int i = 68; i <= 100; ++i) {
+
+            std::string seat =
+                "A" + std::to_string(i);
+
+            seats.emplace(
+                seat,
+                Seat(
+                    seat,
+                    "Platinum",
+                    400
+                )
+            );
+        }
+    }
+
+
+    // ========================================================
+    // BOOK SEAT
+    // ========================================================
+
+    std::string bookSeat(
+        const std::string& seatNumber
+    ) {
+
+        std::lock_guard<std::mutex> lock(
+            bookingMutex
+        );
+
+
+        auto it =
+            seats.find(seatNumber);
+
+
+        if (it == seats.end()) {
+
+            return
+                "404|"
+                "{\"error\":\"Seat not found\"}";
+        }
+
+
+        Seat& seat =
+            it->second;
+
+
+        // ----------------------------------------------------
+        // CRITICAL SECTION
+        // ----------------------------------------------------
+
+        if (seat.booked) {
+
+            return
+                "409|"
+                "{\"error\":\"Seat already booked\"}";
+        }
+
+
+        // Check + mark happens atomically
+        // because both operations are protected
+        // by the same mutex.
+
+        seat.booked = true;
+
+
+        int bookingId =
+            nextBookingId.fetch_add(1);
+
+
+        bookings.emplace_back(
+            bookingId,
+            seatNumber,
+            seat.price
+        );
+
+
+        std::ostringstream json;
+
+
+        json
+            << "{"
+            << "\"bookingId\":"
+            << bookingId
+            << ","
+            << "\"seat\":\""
+            << seatNumber
+            << "\","
+            << "\"type\":\""
+            << seat.type
+            << "\","
+            << "\"amount\":"
+            << seat.price
+            << "}";
+
+
+        return
+            "201|" +
+            json.str();
+    }
+
+
+    // ========================================================
+    // GET SEATS
+    // ========================================================
+
+    std::string getSeats() {
+
+        std::lock_guard<std::mutex> lock(
+            bookingMutex
+        );
+
+
+        std::ostringstream json;
+
+        json << "[";
+
+
+        bool first = true;
+
+
+        for (
+            const auto& item :
+            seats
+        ) {
+
+            const Seat& seat =
+                item.second;
+
+
+            if (!first) {
+                json << ",";
+            }
+
+            first = false;
+
+
+            json
+                << "{"
+                << "\"seat\":\""
+                << seat.number
+                << "\","
+                << "\"type\":\""
+                << seat.type
+                << "\","
+                << "\"price\":"
+                << seat.price
+                << ","
+                << "\"status\":\""
+                << (
+                    seat.booked
+                    ? "BOOKED"
+                    : "AVAILABLE"
+                )
+                << "\""
+                << "}";
+        }
+
+
+        json << "]";
+
+
+        return json.str();
+    }
+};
+
+
+// ============================================================
+// GLOBAL DATA
+// ============================================================
+
+BookingService bookingService;
+
+
+std::vector<Movie> movies = {
+
+    Movie(
+        1,
+        "Interstellar",
+        "English",
+        169
+    ),
+
+    Movie(
+        2,
+        "Inception",
+        "English",
+        148
+    ),
+
+    Movie(
+        3,
+        "3 Idiots",
+        "Hindi",
+        170
+    )
+};
+
+
+std::vector<Show> shows = {
+
+    Show(
+        1,
+        1,
+        1,
+        "10:00"
+    ),
+
+    Show(
+        2,
+        1,
+        1,
+        "14:00"
+    ),
+
+    Show(
+        3,
+        2,
+        2,
+        "18:00"
+    ),
+
+    Show(
+        4,
+        3,
+        3,
+        "21:00"
+    )
+};
+
+
+// ============================================================
+// IOCP CONNECTION
+// ============================================================
+
+struct Connection {
+
+    SOCKET socket;
+
+    HANDLE iocp;
+
+    char receiveBuffer[BUFFER_SIZE];
+
+    std::string requestBuffer;
+
+    std::string sendBuffer;
+
+    WSABUF receiveWSABUF;
+
+    WSABUF sendWSABUF;
+
+    OVERLAPPED receiveOverlapped{};
+
+    OVERLAPPED sendOverlapped{};
+
+    std::atomic<bool> closed{false};
+
+    std::atomic<bool> sendPending{false};
+
+
+    Connection(
+        SOCKET socket,
+        HANDLE iocp
+    )
+        : socket(socket),
+          iocp(iocp) {
+
+        receiveWSABUF.buf =
+            receiveBuffer;
+
+        receiveWSABUF.len =
+            BUFFER_SIZE;
+    }
+};
+
+
+// ============================================================
+// CLOSE CONNECTION
+// ============================================================
+
+void closeConnection(
+    Connection* connection
+) {
+
+    if (connection == nullptr) {
+        return;
+    }
+
+
+    bool expected = false;
+
+
+    if (
+        !connection->closed.compare_exchange_strong(
+            expected,
+            true
+        )
+    ) {
+
+        return;
+    }
+
+
+    shutdown(
+        connection->socket,
+        SD_BOTH
+    );
+
+
+    closesocket(
+        connection->socket
+    );
 }
 
-int main() {
-    Cinema cinema("PVR");
 
-    Screen screen1(1, buildStandardSeats());
-    Screen screen2(2, buildStandardSeats());
-    cinema.addScreen(screen1);
-    cinema.addScreen(screen2);
+// ============================================================
+// SEND RESPONSE
+// ============================================================
 
-    vector<Movie> movies;
-    movies.push_back(Movie("3 Idiots", "Hindi", 170));
-    movies.push_back(Movie("Interstellar", "English", 169));
+void sendResponse(
+    Connection* connection,
+    int statusCode,
+    const std::string& body
+) {
 
-    vector<Show> shows;
-    shows.push_back(Show(&movies[0], &cinema.getScreens()[0], "06:00 PM"));
-    shows.push_back(Show(&movies[1], &cinema.getScreens()[1], "09:00 PM"));
+    if (
+        connection->closed.load()
+    ) {
+        return;
+    }
 
-    BookingService bookingService;
 
-    int choice;
+    std::string statusText;
+
+
+    switch (statusCode) {
+
+        case 200:
+            statusText = "OK";
+            break;
+
+        case 201:
+            statusText = "Created";
+            break;
+
+        case 400:
+            statusText = "Bad Request";
+            break;
+
+        case 404:
+            statusText = "Not Found";
+            break;
+
+        case 409:
+            statusText = "Conflict";
+            break;
+
+        default:
+            statusText = "Internal Server Error";
+            break;
+    }
+
+
+    std::ostringstream response;
+
+
+    response
+        << "HTTP/1.1 "
+        << statusCode
+        << " "
+        << statusText
+        << "\r\n";
+
+
+    response
+        << "Content-Type: application/json\r\n";
+
+
+    response
+        << "Content-Length: "
+        << body.size()
+        << "\r\n";
+
+
+    response
+        << "Connection: keep-alive\r\n";
+
+
+    response
+        << "Keep-Alive: timeout=30\r\n";
+
+
+    response
+        << "\r\n";
+
+
+    response
+        << body;
+
+
+    connection->sendBuffer =
+        response.str();
+
+
+    connection->sendWSABUF.buf =
+        connection->sendBuffer.data();
+
+
+    connection->sendWSABUF.len =
+        static_cast<ULONG>(
+            connection->sendBuffer.size()
+        );
+
+
+    connection->sendPending.store(
+        true
+    );
+
+
+    DWORD bytesSent = 0;
+
+
+    int result =
+        WSASend(
+            connection->socket,
+            &connection->sendWSABUF,
+            1,
+            &bytesSent,
+            0,
+            &connection->sendOverlapped,
+            nullptr
+        );
+
+
+    if (
+        result == SOCKET_ERROR
+    ) {
+
+        int error =
+            WSAGetLastError();
+
+
+        if (
+            error != WSA_IO_PENDING
+        ) {
+
+            connection->sendPending.store(
+                false
+            );
+
+            closeConnection(
+                connection
+            );
+        }
+    }
+}
+
+
+// ============================================================
+// ROUTER
+// ============================================================
+
+void processRequest(
+    Connection* connection,
+    const std::string& request
+) {
+
+    std::istringstream stream(
+        request
+    );
+
+
+    std::string method;
+
+    std::string path;
+
+    std::string version;
+
+
+    stream
+        >> method
+        >> path
+        >> version;
+
+
+    // ========================================================
+    // HEALTH
+    // ========================================================
+
+    if (
+        method == "GET" &&
+        path == "/health"
+    ) {
+
+        sendResponse(
+            connection,
+            200,
+            "{\"status\":\"UP\"}"
+        );
+
+        return;
+    }
+
+
+    // ========================================================
+    // MOVIES
+    // ========================================================
+
+    if (
+        method == "GET" &&
+        path == "/movies"
+    ) {
+
+        std::ostringstream json;
+
+        json << "[";
+
+
+        for (
+            size_t i = 0;
+            i < movies.size();
+            ++i
+        ) {
+
+            if (i > 0) {
+                json << ",";
+            }
+
+
+            json
+                << "{"
+                << "\"id\":"
+                << movies[i].id
+                << ","
+                << "\"title\":\""
+                << movies[i].title
+                << "\","
+                << "\"language\":\""
+                << movies[i].language
+                << "\","
+                << "\"duration\":"
+                << movies[i].duration
+                << "}";
+        }
+
+
+        json << "]";
+
+
+        sendResponse(
+            connection,
+            200,
+            json.str()
+        );
+
+        return;
+    }
+
+
+    // ========================================================
+    // SHOWS
+    // ========================================================
+
+    if (
+        method == "GET" &&
+        path == "/shows"
+    ) {
+
+        std::ostringstream json;
+
+        json << "[";
+
+
+        for (
+            size_t i = 0;
+            i < shows.size();
+            ++i
+        ) {
+
+            if (i > 0) {
+                json << ",";
+            }
+
+
+            json
+                << "{"
+                << "\"id\":"
+                << shows[i].id
+                << ","
+                << "\"movieId\":"
+                << shows[i].movieId
+                << ","
+                << "\"screenId\":"
+                << shows[i].screenId
+                << ","
+                << "\"time\":\""
+                << shows[i].time
+                << "\""
+                << "}";
+        }
+
+
+        json << "]";
+
+
+        sendResponse(
+            connection,
+            200,
+            json.str()
+        );
+
+        return;
+    }
+
+
+    // ========================================================
+    // SEATS
+    // ========================================================
+
+    if (
+        method == "GET" &&
+        path == "/seats"
+    ) {
+
+        sendResponse(
+            connection,
+            200,
+            bookingService.getSeats()
+        );
+
+        return;
+    }
+
+
+    // ========================================================
+    // BOOK
+    // ========================================================
+
+    if (
+        method == "POST"
+    ) {
+
+        const std::string prefix =
+            "/book?seat=";
+
+
+        if (
+            path.rfind(prefix, 0) == 0
+        ) {
+
+            std::string seatNumber =
+                path.substr(
+                    prefix.size()
+                );
+
+
+            size_t amp =
+                seatNumber.find('&');
+
+
+            if (
+                amp != std::string::npos
+            ) {
+
+                seatNumber =
+                    seatNumber.substr(
+                        0,
+                        amp
+                    );
+            }
+
+
+            if (
+                seatNumber.empty()
+            ) {
+
+                sendResponse(
+                    connection,
+                    400,
+                    "{\"error\":\"Seat required\"}"
+                );
+
+                return;
+            }
+
+
+            std::string result =
+                bookingService.bookSeat(
+                    seatNumber
+                );
+
+
+            size_t separator =
+                result.find('|');
+
+
+            int statusCode =
+                std::stoi(
+                    result.substr(
+                        0,
+                        separator
+                    )
+                );
+
+
+            std::string body =
+                result.substr(
+                    separator + 1
+                );
+
+
+            sendResponse(
+                connection,
+                statusCode,
+                body
+            );
+
+
+            return;
+        }
+    }
+
+
+    // ========================================================
+    // 404
+    // ========================================================
+
+    sendResponse(
+        connection,
+        404,
+        "{\"error\":\"Endpoint not found\"}"
+    );
+}
+
+
+// ============================================================
+// START RECEIVE
+// ============================================================
+
+void startReceive(
+    Connection* connection
+) {
+
+    if (
+        connection->closed.load()
+    ) {
+        return;
+    }
+
+
+    ZeroMemory(
+        &connection->receiveOverlapped,
+        sizeof(OVERLAPPED)
+    );
+
+
+    connection->receiveWSABUF.buf =
+        connection->receiveBuffer;
+
+
+    connection->receiveWSABUF.len =
+        BUFFER_SIZE;
+
+
+    DWORD flags = 0;
+
+    DWORD bytesReceived = 0;
+
+
+    int result =
+        WSARecv(
+            connection->socket,
+            &connection->receiveWSABUF,
+            1,
+            &bytesReceived,
+            &flags,
+            &connection->receiveOverlapped,
+            nullptr
+        );
+
+
+    if (
+        result == SOCKET_ERROR
+    ) {
+
+        int error =
+            WSAGetLastError();
+
+
+        if (
+            error != WSA_IO_PENDING
+        ) {
+
+            closeConnection(
+                connection
+            );
+        }
+    }
+}
+
+
+// ============================================================
+// PROCESS COMPLETED HTTP REQUEST
+// ============================================================
+
+void handleReceiveCompletion(
+    Connection* connection,
+    DWORD bytesTransferred,
+    ThreadPool& workers
+) {
+
+    if (
+        bytesTransferred == 0
+    ) {
+
+        closeConnection(
+            connection
+        );
+
+        return;
+    }
+
+
+    connection->requestBuffer.append(
+        connection->receiveBuffer,
+        bytesTransferred
+    );
+
+
+    // --------------------------------------------------------
+    // Wait for complete HTTP headers.
+    // --------------------------------------------------------
+
+    size_t headerEnd =
+        connection->requestBuffer.find(
+            "\r\n\r\n"
+        );
+
+
+    if (
+        headerEnd == std::string::npos
+    ) {
+
+        startReceive(
+            connection
+        );
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // Extract request.
+    // --------------------------------------------------------
+
+    std::string request =
+        connection->requestBuffer;
+
+
+    connection->requestBuffer.clear();
+
+
+    // --------------------------------------------------------
+    // IMPORTANT:
+    //
+    // We don't start another receive yet.
+    //
+    // The current request is processed by the worker pool.
+    // After WSASend completes, the next receive begins.
+    //
+    // This prevents two requests on one connection from
+    // writing responses simultaneously.
+    // --------------------------------------------------------
+
+    workers.enqueue(
+        [
+            connection,
+            request
+        ]() {
+
+            if (
+                connection->closed.load()
+            ) {
+                return;
+            }
+
+
+            processRequest(
+                connection,
+                request
+            );
+        }
+    );
+}
+
+
+// ============================================================
+// IOCP WORKER
+// ============================================================
+
+void iocpWorker(
+    HANDLE iocp,
+    ThreadPool& workers
+) {
+
     while (true) {
-        cout << endl;
-        cout << "===== MOVIE TICKET BOOKING =====" << endl;
-        cout << "1. Movies  2. Book  3. Cancel  4. My tickets   0. Exit" << endl;
-        cout << "Choose: ";
 
-        if (!(cin >> choice)) {
-            cin.clear();
-            cin.ignore(10000, '\n');
-            cout << "Invalid input." << endl;
+        DWORD bytesTransferred = 0;
+
+        ULONG_PTR completionKey = 0;
+
+        OVERLAPPED* overlapped = nullptr;
+
+
+        BOOL result =
+            GetQueuedCompletionStatus(
+                iocp,
+                &bytesTransferred,
+                &completionKey,
+                &overlapped,
+                INFINITE
+            );
+
+
+        Connection* connection =
+            reinterpret_cast<
+                Connection*
+            >(completionKey);
+
+
+        if (
+            connection == nullptr
+        ) {
+
             continue;
         }
 
-        if (choice == 0) {
-            break;
-        }
-        else if (choice == 1) {
-            cout << endl;
-            for (int i = 0; i < (int)movies.size(); i++) {
-                cout << "[" << i + 1 << "] " << movies[i].getTitle() << "  "
-                     << movies[i].getLanguage() << "  " << movies[i].getDuration() << " min" << endl;
-            }
-        }
-        else if (choice == 2) {
-            cout << endl;
-            for (int i = 0; i < (int)movies.size(); i++) {
-                cout << "[" << i + 1 << "] " << movies[i].getTitle() << endl;
-            }
-            cout << "Choose movie: ";
-            int movieChoice;
-            cin >> movieChoice;
 
-            if (movieChoice < 1 || movieChoice > (int)movies.size()) {
-                cout << "Invalid movie choice." << endl;
+        if (
+            !result
+        ) {
+
+            closeConnection(
+                connection
+            );
+
+            continue;
+        }
+
+
+        // ====================================================
+        // RECEIVE COMPLETION
+        // ====================================================
+
+        if (
+            overlapped ==
+            &connection->receiveOverlapped
+        ) {
+
+            handleReceiveCompletion(
+                connection,
+                bytesTransferred,
+                workers
+            );
+
+            continue;
+        }
+
+
+        // ====================================================
+        // SEND COMPLETION
+        // ====================================================
+
+        if (
+            overlapped ==
+            &connection->sendOverlapped
+        ) {
+
+            connection->sendPending.store(
+                false
+            );
+
+
+            if (
+                connection->closed.load()
+            ) {
+
                 continue;
             }
 
-            vector<Show*> matchingShows;
-            for (int i = 0; i < (int)shows.size(); i++) {
-                if (&movies[movieChoice - 1] == shows[i].getMovie()) {
-                    matchingShows.push_back(&shows[i]);
-                }
-            }
 
-            if (matchingShows.empty()) {
-                cout << "No shows for this movie." << endl;
-                continue;
-            }
+            // Clear response.
+            connection->sendBuffer.clear();
 
-            for (int i = 0; i < (int)matchingShows.size(); i++) {
-                cout << "[" << i + 1 << "] Screen-" << matchingShows[i]->getScreen()->getScreenNumber()
-                     << "  " << matchingShows[i]->getStartTime() << endl;
-            }
-            cout << "Choose show: ";
-            int showChoice;
-            cin >> showChoice;
 
-            if (showChoice < 1 || showChoice > (int)matchingShows.size()) {
-                cout << "Invalid show choice." << endl;
-                continue;
-            }
+            // Ready for next request.
+            startReceive(
+                connection
+            );
 
-            Show* selectedShow = matchingShows[showChoice - 1];
-            printSeatLayout(selectedShow);
 
-            cout << "Seats (e.g. A1,B2): ";
-            string seatInput;
-            cin >> seatInput;
-
-            cout << "Enter customer name: ";
-            string name;
-            cin >> name;
-            cout << "Enter phone: ";
-            string phone;
-            cin >> phone;
-            Customer customer(name, phone);
-
-            cout << "Pay by: 1.UPI  2.Card  3.Cash > ";
-            int paymentChoice;
-            cin >> paymentChoice;
-
-            cout << "Simulate payment: 1.Success  2.Failure > ";
-            int simChoice;
-            cin >> simChoice;
-            bool simulateSuccess = (simChoice == 1);
-
-            Booking* booking = bookingService.bookTicket(selectedShow, customer, seatInput, paymentChoice, simulateSuccess);
-
-            if (booking != nullptr && booking->getStatus() == BookingStatus::CONFIRMED) {
-                TicketPrinter::printTicket(booking);
-            }
+            continue;
         }
-        else if (choice == 3) {
-            cout << "Enter booking ID to cancel: ";
-            string bookingId;
-            cin >> bookingId;
-            bool cancelled = bookingService.cancelBooking(bookingId);
-            if (cancelled) {
-                cout << "Booking cancelled. Seats released." << endl;
-            } else {
-                cout << "Booking not found or already cancelled." << endl;
+    }
+}
+
+
+// ============================================================
+// MAIN
+// ============================================================
+
+int main() {
+
+    // ========================================================
+    // WINSOCK
+    // ========================================================
+
+    WSADATA wsaData;
+
+
+    if (
+        WSAStartup(
+            MAKEWORD(2, 2),
+            &wsaData
+        ) != 0
+    ) {
+
+        std::cerr
+            << "WSAStartup failed\n";
+
+        return 1;
+    }
+
+
+    // ========================================================
+    // CREATE LISTEN SOCKET
+    // ========================================================
+
+    SOCKET serverSocket =
+        socket(
+            AF_INET,
+            SOCK_STREAM,
+            IPPROTO_TCP
+        );
+
+
+    if (
+        serverSocket ==
+        INVALID_SOCKET
+    ) {
+
+        std::cerr
+            << "Socket creation failed\n";
+
+        WSACleanup();
+
+        return 1;
+    }
+
+
+    // ========================================================
+    // REUSE ADDRESS
+    // ========================================================
+
+    BOOL reuse = TRUE;
+
+
+    setsockopt(
+        serverSocket,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        reinterpret_cast<char*>(&reuse),
+        sizeof(reuse)
+    );
+
+
+    // ========================================================
+    // SERVER ADDRESS
+    // ========================================================
+
+    sockaddr_in serverAddress{};
+
+
+    serverAddress.sin_family =
+        AF_INET;
+
+
+    serverAddress.sin_addr.s_addr =
+        INADDR_ANY;
+
+
+    serverAddress.sin_port =
+        htons(PORT);
+
+
+    // ========================================================
+    // BIND
+    // ========================================================
+
+    if (
+        bind(
+            serverSocket,
+            reinterpret_cast<
+                sockaddr*
+            >(&serverAddress),
+            sizeof(serverAddress)
+        ) == SOCKET_ERROR
+    ) {
+
+        std::cerr
+            << "Bind failed\n";
+
+        closesocket(
+            serverSocket
+        );
+
+        WSACleanup();
+
+        return 1;
+    }
+
+
+    // ========================================================
+    // LISTEN
+    // ========================================================
+
+    if (
+        listen(
+            serverSocket,
+            LISTEN_BACKLOG
+        ) == SOCKET_ERROR
+    ) {
+
+        std::cerr
+            << "Listen failed\n";
+
+        closesocket(
+            serverSocket
+        );
+
+        WSACleanup();
+
+        return 1;
+    }
+
+
+    // ========================================================
+    // CREATE IOCP
+    // ========================================================
+
+    HANDLE iocp =
+        CreateIoCompletionPort(
+            INVALID_HANDLE_VALUE,
+            nullptr,
+            0,
+            IOCP_THREADS
+        );
+
+
+    if (
+        iocp == nullptr
+    ) {
+
+        std::cerr
+            << "IOCP creation failed\n";
+
+        closesocket(
+            serverSocket
+        );
+
+        WSACleanup();
+
+        return 1;
+    }
+
+
+    // ========================================================
+    // APPLICATION WORKERS
+    // ========================================================
+
+    ThreadPool workers(
+        WORKER_THREADS
+    );
+
+
+    // ========================================================
+    // IOCP THREADS
+    // ========================================================
+
+    std::vector<std::thread>
+        iocpThreads;
+
+
+    for (
+        int i = 0;
+        i < IOCP_THREADS;
+        ++i
+    ) {
+
+        iocpThreads.emplace_back(
+            [&iocp, &workers]() {
+
+                iocpWorker(
+                    iocp,
+                    workers
+                );
             }
+        );
+    }
+
+
+    // ========================================================
+    // SERVER INFO
+    // ========================================================
+
+    std::cout
+        << "=====================================\n"
+        << " Movie Ticket Booking Server\n"
+        << "=====================================\n"
+        << "Port           : "
+        << PORT
+        << "\n"
+        << "IOCP Threads   : "
+        << IOCP_THREADS
+        << "\n"
+        << "Worker Threads : "
+        << WORKER_THREADS
+        << "\n"
+        << "Architecture   : Windows IOCP\n"
+        << "                 + Thread Pool\n"
+        << "Connection     : HTTP Keep-Alive\n"
+        << "=====================================\n";
+
+
+    // ========================================================
+    // ACCEPT LOOP
+    // ========================================================
+
+    while (true) {
+
+        SOCKET clientSocket =
+            accept(
+                serverSocket,
+                nullptr,
+                nullptr
+            );
+
+
+        if (
+            clientSocket ==
+            INVALID_SOCKET
+        ) {
+
+            std::cerr
+                << "Accept failed\n";
+
+            continue;
         }
-        else if (choice == 4) {
-            vector<Booking*> allBookings = bookingService.getBookings();
-            if (allBookings.empty()) {
-                cout << "No bookings yet." << endl;
-            }
-            for (int i = 0; i < (int)allBookings.size(); i++) {
-                TicketPrinter::printTicket(allBookings[i]);
-            }
+
+
+        // ----------------------------------------------------
+        // Create connection state.
+        //
+        // Intentionally retained for the lifetime of the
+        // process. With 1000 concurrent VUs this is tiny
+        // memory overhead and avoids unsafe deletion while
+        // Windows still has an overlapped operation pending.
+        // ----------------------------------------------------
+
+        Connection* connection =
+            new Connection(
+                clientSocket,
+                iocp
+            );
+
+
+        // ----------------------------------------------------
+        // Associate socket with IOCP.
+        // ----------------------------------------------------
+
+        HANDLE associated =
+            CreateIoCompletionPort(
+                reinterpret_cast<HANDLE>(
+                    clientSocket
+                ),
+                iocp,
+                reinterpret_cast<ULONG_PTR>(
+                    connection
+                ),
+                0
+            );
+
+
+        if (
+            associated == nullptr
+        ) {
+
+            std::cerr
+                << "Failed to associate socket with IOCP\n";
+
+            closeConnection(
+                connection
+            );
+
+            delete connection;
+
+            continue;
         }
-        else {
-            cout << "Invalid choice." << endl;
+
+
+        // ----------------------------------------------------
+        // Start asynchronous receive.
+        // ----------------------------------------------------
+
+        startReceive(
+            connection
+        );
+    }
+
+
+    // ========================================================
+    // SHUTDOWN
+    // ========================================================
+
+    closesocket(
+        serverSocket
+    );
+
+
+    CloseHandle(
+        iocp
+    );
+
+
+    for (
+        auto& thread :
+        iocpThreads
+    ) {
+
+        if (
+            thread.joinable()
+        ) {
+
+            thread.join();
         }
     }
 
-    cout << "Thank you for visiting!" << endl;
+
+    WSACleanup();
+
+
     return 0;
 }

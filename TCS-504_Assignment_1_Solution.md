@@ -203,105 +203,58 @@ classDiagram
 
 ```mermaid
 sequenceDiagram
-    actor Customer
-    participant API as HTTP API
-    participant IOCP as Windows IOCP
-    participant Pool as Worker Thread Pool
-    participant BS as BookingService
-    participant SS as ShowSeat
-    participant PC as PriceCalculator
-    participant Pay as Payment
-    participant B as Booking
-    participant TP as TicketPrinter
+    participant customer as Customer
+    participant bookingService as BookingService
+    participant show as Show
+    participant showSeat as ShowSeat
+    participant priceCalculator as PriceCalculator
+    participant payment as UpiPayment
+    participant booking as Booking
+    participant ticketPrinter as TicketPrinter
 
-    Customer->>API: POST /book?seat=A1
-    API->>IOCP: Receive HTTP request
-    IOCP->>Pool: Dispatch request
-    Pool->>BS: bookTicket(show, customer, A1)
+    customer->>bookingService: bookTicket(show, customer, "A1", UPI)
+    activate bookingService
 
-    BS->>BS: Lock seat mutex
-    BS->>SS: Check availability
-    SS-->>BS: AVAILABLE
-    BS->>PC: Calculate price
-    PC-->>BS: ₹150
-    BS->>Pay: pay(₹150)
-    Pay-->>BS: Payment successful
-    BS->>SS: markBooked()
-    BS->>B: Create & confirm booking
-    BS->>TP: printTicket(booking)
-    TP-->>BS: Ticket generated
-    BS->>BS: Unlock seat mutex
-    BS-->>Pool: Booking result
-    Pool-->>IOCP: HTTP response
-    IOCP-->>API: 201 Created
-    API-->>Customer: Booking confirmed
-```
+    bookingService->>show: getShowSeats()
+    activate show
+    show-->>bookingService: showSeats list
+    deactivate show
 
-## System Architecture
+    bookingService->>showSeat: isAvailable()
+    activate showSeat
+    showSeat-->>bookingService: true
+    deactivate showSeat
 
-```mermaid
-flowchart LR
-    K6["k6<br/>1000 Concurrent VUs"]
+    bookingService->>priceCalculator: calculateTotal([showSeat])
+    activate priceCalculator
+    priceCalculator-->>bookingService: 150.0
+    deactivate priceCalculator
 
-    subgraph SERVER["C++ HTTP Server"]
-        IOCP["Windows IOCP<br/>Asynchronous I/O"]
-        ACCEPT["IOCP Acceptors"]
-        POOL["Worker Thread Pool<br/>128 Workers"]
-        API["HTTP API Layer<br/>GET /health<br/>GET /movies<br/>GET /shows<br/>GET /seats<br/>POST /book"]
-    end
+    bookingService->>payment: «create» new UpiPayment()
+    activate payment
 
-    subgraph APP["Application Layer"]
-        BS["BookingService<br/>Thread-Safe Booking"]
-        MUTEX["std::mutex<br/>Seat Synchronization"]
-    end
+    bookingService->>booking: «create» new Booking(show, customer, seats, 150.0)
+    activate booking
 
-    subgraph DOMAIN["Domain Model"]
-        MOVIE["Movie"]
-        SHOW["Show"]
-        SCREEN["Screen"]
-        SEAT["Seat"]
-        SHOWSEAT["ShowSeat"]
-        CUSTOMER["Customer"]
-        BOOKING["Booking"]
-        PAYMENT["Payment<br/>UPI / Card / Cash"]
-        PRICE["PriceCalculator"]
-        TICKET["TicketPrinter"]
-    end
+    bookingService->>payment: pay(150.0)
+    payment-->>bookingService: true
+    deactivate payment
 
-    subgraph DATA["In-Memory Data"]
-        SEATMAP["Seat Map"]
-        BOOKINGS["Bookings"]
-    end
+    bookingService->>showSeat: markBooked()
+    activate showSeat
+    showSeat-->>bookingService: (void)
+    deactivate showSeat
 
-    K6 -->|"HTTP Requests<br/>Keep-Alive"| IOCP
-    IOCP --> ACCEPT
-    ACCEPT --> POOL
-    POOL --> API
-    API --> BS
+    bookingService->>booking: confirm()
+    booking-->>bookingService: (void)
+    deactivate booking
 
-    BS --> MUTEX
-    BS --> MOVIE
-    BS --> SHOW
-    BS --> SEAT
-    BS --> SHOWSEAT
-    BS --> CUSTOMER
-    BS --> BOOKING
-    BS --> PAYMENT
-    BS --> PRICE
-    BS --> TICKET
+    bookingService->>ticketPrinter: printTicket(booking)
+    activate ticketPrinter
+    ticketPrinter-->>customer: prints ticket to console
+    deactivate ticketPrinter
 
-    BS --> SEATMAP
-    BS --> BOOKINGS
-
-    MOVIE --> SHOW
-    SHOW --> SCREEN
-    SCREEN --> SEAT
-    SHOW --> SHOWSEAT
-    BOOKING --> CUSTOMER
-    BOOKING --> PAYMENT
-
-    API -->|"HTTP Response"| K6
-```
+    deactivate bookingService
 ```
 
 ---
@@ -310,20 +263,11 @@ flowchart LR
 
 See the accompanying `.cpp` files (`01_Movie.cpp` through `13_BookingService.cpp`, plus `main.cpp`). One class per file, no header files — classes are `#include`d directly, in dependency order, from `main.cpp`.
 
-**To compile and run the C++ HTTP server:**
-```powershell
-g++ -std=c++17 -O2 -pthread main.cpp -lws2_32 -o main
-.\main.exe
+**To compile and run:**
+```bash
+g++ -std=c++17 main.cpp -o movie_booking
+./movie_booking
 ```
-
-The server exposes:
-- `GET /health`
-- `GET /movies`
-- `GET /shows`
-- `GET /seats`
-- `POST /book?seat=A1`
-
-Load testing is performed with **k6** using up to **1,000 concurrent VUs**.
 
 ---
 
