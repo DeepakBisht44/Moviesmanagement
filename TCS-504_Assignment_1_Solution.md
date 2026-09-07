@@ -202,6 +202,41 @@ classDiagram
 ## E. Sequence Diagram — "Customer books 1 seat and pays by UPI"
 
 ```mermaid
+sequenceDiagram
+    actor Customer
+    participant API as HTTP API
+    participant IOCP as Windows IOCP
+    participant Pool as Worker Thread Pool
+    participant BS as BookingService
+    participant SS as ShowSeat
+    participant PC as PriceCalculator
+    participant Pay as Payment
+    participant B as Booking
+    participant TP as TicketPrinter
+
+    Customer->>API: POST /book?seat=A1
+    API->>IOCP: Receive HTTP request
+    IOCP->>Pool: Dispatch request
+    Pool->>BS: bookTicket(show, customer, A1)
+
+    BS->>BS: Lock seat mutex
+    BS->>SS: Check availability
+    SS-->>BS: AVAILABLE
+    BS->>PC: Calculate price
+    PC-->>BS: ₹150
+    BS->>Pay: pay(₹150)
+    Pay-->>BS: Payment successful
+    BS->>SS: markBooked()
+    BS->>B: Create & confirm booking
+    BS->>TP: printTicket(booking)
+    TP-->>BS: Ticket generated
+    BS->>BS: Unlock seat mutex
+    BS-->>Pool: Booking result
+    Pool-->>IOCP: HTTP response
+    IOCP-->>API: 201 Created
+    API-->>Customer: Booking confirmed
+```
+
 ## System Architecture
 
 ```mermaid
@@ -275,11 +310,20 @@ flowchart LR
 
 See the accompanying `.cpp` files (`01_Movie.cpp` through `13_BookingService.cpp`, plus `main.cpp`). One class per file, no header files — classes are `#include`d directly, in dependency order, from `main.cpp`.
 
-**To compile and run:**
-```bash
-g++ -std=c++17 main.cpp -o movie_booking
-./movie_booking
+**To compile and run the C++ HTTP server:**
+```powershell
+g++ -std=c++17 -O2 -pthread main.cpp -lws2_32 -o main
+.\main.exe
 ```
+
+The server exposes:
+- `GET /health`
+- `GET /movies`
+- `GET /shows`
+- `GET /seats`
+- `POST /book?seat=A1`
+
+Load testing is performed with **k6** using up to **1,000 concurrent VUs**.
 
 ---
 
