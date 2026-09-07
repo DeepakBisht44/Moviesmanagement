@@ -202,59 +202,71 @@ classDiagram
 ## E. Sequence Diagram — "Customer books 1 seat and pays by UPI"
 
 ```mermaid
-sequenceDiagram
-    participant customer as Customer
-    participant bookingService as BookingService
-    participant show as Show
-    participant showSeat as ShowSeat
-    participant priceCalculator as PriceCalculator
-    participant payment as UpiPayment
-    participant booking as Booking
-    participant ticketPrinter as TicketPrinter
+## System Architecture
 
-    customer->>bookingService: bookTicket(show, customer, "A1", UPI)
-    activate bookingService
+```mermaid
+flowchart LR
+    K6["k6<br/>1000 Concurrent VUs"]
 
-    bookingService->>show: getShowSeats()
-    activate show
-    show-->>bookingService: showSeats list
-    deactivate show
+    subgraph SERVER["C++ HTTP Server"]
+        IOCP["Windows IOCP<br/>Asynchronous I/O"]
+        ACCEPT["IOCP Acceptors"]
+        POOL["Worker Thread Pool<br/>128 Workers"]
+        API["HTTP API Layer<br/>GET /health<br/>GET /movies<br/>GET /shows<br/>GET /seats<br/>POST /book"]
+    end
 
-    bookingService->>showSeat: isAvailable()
-    activate showSeat
-    showSeat-->>bookingService: true
-    deactivate showSeat
+    subgraph APP["Application Layer"]
+        BS["BookingService<br/>Thread-Safe Booking"]
+        MUTEX["std::mutex<br/>Seat Synchronization"]
+    end
 
-    bookingService->>priceCalculator: calculateTotal([showSeat])
-    activate priceCalculator
-    priceCalculator-->>bookingService: 150.0
-    deactivate priceCalculator
+    subgraph DOMAIN["Domain Model"]
+        MOVIE["Movie"]
+        SHOW["Show"]
+        SCREEN["Screen"]
+        SEAT["Seat"]
+        SHOWSEAT["ShowSeat"]
+        CUSTOMER["Customer"]
+        BOOKING["Booking"]
+        PAYMENT["Payment<br/>UPI / Card / Cash"]
+        PRICE["PriceCalculator"]
+        TICKET["TicketPrinter"]
+    end
 
-    bookingService->>payment: «create» new UpiPayment()
-    activate payment
+    subgraph DATA["In-Memory Data"]
+        SEATMAP["Seat Map"]
+        BOOKINGS["Bookings"]
+    end
 
-    bookingService->>booking: «create» new Booking(show, customer, seats, 150.0)
-    activate booking
+    K6 -->|"HTTP Requests<br/>Keep-Alive"| IOCP
+    IOCP --> ACCEPT
+    ACCEPT --> POOL
+    POOL --> API
+    API --> BS
 
-    bookingService->>payment: pay(150.0)
-    payment-->>bookingService: true
-    deactivate payment
+    BS --> MUTEX
+    BS --> MOVIE
+    BS --> SHOW
+    BS --> SEAT
+    BS --> SHOWSEAT
+    BS --> CUSTOMER
+    BS --> BOOKING
+    BS --> PAYMENT
+    BS --> PRICE
+    BS --> TICKET
 
-    bookingService->>showSeat: markBooked()
-    activate showSeat
-    showSeat-->>bookingService: (void)
-    deactivate showSeat
+    BS --> SEATMAP
+    BS --> BOOKINGS
 
-    bookingService->>booking: confirm()
-    booking-->>bookingService: (void)
-    deactivate booking
+    MOVIE --> SHOW
+    SHOW --> SCREEN
+    SCREEN --> SEAT
+    SHOW --> SHOWSEAT
+    BOOKING --> CUSTOMER
+    BOOKING --> PAYMENT
 
-    bookingService->>ticketPrinter: printTicket(booking)
-    activate ticketPrinter
-    ticketPrinter-->>customer: prints ticket to console
-    deactivate ticketPrinter
-
-    deactivate bookingService
+    API -->|"HTTP Response"| K6
+```
 ```
 
 ---
